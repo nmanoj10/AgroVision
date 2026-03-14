@@ -19,9 +19,36 @@ const PORT = process.env.BACKEND_PORT || 5000;
 
 app.set('trust proxy', true);
 
+const allowedOrigins = new Set([
+  'http://localhost:3000',
+  'http://localhost:5173',
+]);
+
+const envOrigins = [process.env.FRONTEND_URLS, process.env.FRONTEND_URL]
+  .filter(Boolean)
+  .flatMap((value) => String(value).split(','))
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+envOrigins.forEach((origin) => allowedOrigins.add(origin));
+
 app.use(
   cors({
-    origin: ['http://localhost:3000', 'http://localhost:5173', process.env.FRONTEND_URL].filter(Boolean),
+    origin: (origin, callback) => {
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.has(origin)) {
+        return callback(null, true);
+      }
+
+      if (origin.endsWith('.vercel.app')) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
   })
 );
