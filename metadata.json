@@ -1,0 +1,5 @@
+{
+  "name": "AgroVision",
+  "description": "AI-powered agricultural assistant for crop disease detection, weather forecasting, and farmer advisory.",
+  "requestFramePermissions": ["camera", "geolocation"]
+}
