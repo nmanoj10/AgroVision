@@ -7,8 +7,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 3001
       - key: FRONTEND_URL
         sync: false
       - key: MONGODB_URI
@@ -33,5 +31,7 @@ services:
         sync: false
       - key: MODEL_PATH
         value: ./src/models/trained_model.keras
+      - key: PYTHON_EXECUTABLE
+        value: python3
       - key: MODEL_CONFIDENCE_THRESHOLD
         value: "85"
