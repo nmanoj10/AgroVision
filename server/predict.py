@@ -113,6 +113,58 @@ Rules:
 - If healthy, use disease_name as "Healthy Plant", is_healthy=true, pesticides=[].
 """
 
+GEMINI_ENRICH_PROMPT = """
+You are an expert agricultural plant pathologist.
+The local model has already classified the leaf disease. Your job is to explain it clearly.
+Return ONLY valid JSON using the schema below. Do NOT change the disease name or health status.
+
+Provided local classification:
+- disease_name: "{disease_name}"
+- is_healthy: {is_healthy}
+- confidence: {confidence}
+- crop: "{crop}"
+
+Required JSON schema:
+{
+  "disease_name": "{disease_name}",
+  "confidence": {confidence},
+  "severity": "Low",
+  "affected_area_percent": 0,
+  "is_healthy": {is_healthy},
+  "symptoms": ["symptom 1", "symptom 2", "symptom 3"],
+  "why_it_happened": "Short explanation of why it occurs.",
+  "diagnosis": "Short diagnosis or prediction statement.",
+  "causes": ["cause 1", "cause 2", "cause 3"],
+  "treatment": ["step 1", "step 2", "step 3", "step 4"],
+  "prevention": ["tip 1", "tip 2", "tip 3"],
+  "pesticides": [
+    {
+      "name": "Product name",
+      "description": "What it helps with",
+      "active_ingredient": "Active ingredient",
+      "purchase_link": "https://www.amazon.in/s?k=product+name",
+      "price_range": "Rs. 200-400",
+      "usage_steps": ["usage 1", "usage 2", "usage 3", "usage 4"]
+    }
+  ]
+}
+
+Rules:
+- Return only JSON.
+- confidence must be 0-100.
+- severity must be one of: Low, Medium, High, Critical.
+- symptoms: exactly 3 items unless healthy.
+- causes: exactly 3 items unless healthy.
+- treatment: exactly 4 items unless healthy.
+- prevention: exactly 3 items.
+- If healthy, use disease_name as "Healthy Plant", is_healthy=true, pesticides=[].
+"""
+
+
+def is_truthy_env(name, default=""):
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def load_env_file():
     env_path = os.path.join(ROOT_DIR, ".env")
@@ -573,6 +625,45 @@ def gemini_request(image_path):
     raise RuntimeError(last_error or "All Gemini models failed.")
 
 
+def gemini_request_text(prompt):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    payload = {
+        "generationConfig": {"responseMimeType": "application/json"},
+        "contents": [{"parts": [{"text": prompt}]}],
+    }
+
+    request_data = json.dumps(payload).encode("utf-8")
+    last_error = None
+    model_names = get_supported_gemini_models(api_key)
+
+    for model_name in model_names:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        request = urllib.request.Request(
+            endpoint,
+            data=request_data,
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                return model_name, body
+        except urllib.error.HTTPError as exc:
+            last_error = normalize_gemini_error(exc.read().decode("utf-8", errors="ignore"), exc.code)
+            if exc.code in (404, 429, 500, 503):
+                continue
+            raise RuntimeError(last_error or str(exc)) from exc
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    raise RuntimeError(last_error or "All Gemini models failed.")
+
+
 def normalize_gemini_error(raw_error, status_code=None):
     try:
         parsed = json.loads(raw_error)
@@ -695,6 +786,52 @@ def run_gemini_fallback(image_path, local_result=None):
     }
 
 
+def run_gemini_enrichment(local_result):
+    prediction = local_result.get("model_prediction") or {}
+    crop = prediction.get("crop") or "Unknown Crop"
+    confidence = prediction.get("confidence", 75)
+    is_healthy = bool(prediction.get("is_healthy", False))
+    disease_name = (local_result.get("data") or {}).get("disease_name") or prediction.get("disease_name") or "Unknown Disease"
+
+    prompt = GEMINI_ENRICH_PROMPT.format(
+        disease_name=disease_name,
+        is_healthy=str(is_healthy).lower(),
+        confidence=confidence,
+        crop=crop,
+    )
+
+    model_name, raw_response = gemini_request_text(prompt)
+    text = extract_gemini_text(raw_response)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        raise RuntimeError("Gemini returned a non-JSON response.")
+
+    parsed = json.loads(text[start : end + 1])
+    parsed["disease_name"] = disease_name
+    parsed["is_healthy"] = is_healthy
+    parsed["confidence"] = confidence
+
+    normalized = normalize_gemini_result(parsed)
+    normalized["disease_name"] = disease_name
+    normalized["is_healthy"] = is_healthy
+    normalized["confidence"] = confidence
+
+    model_status = dict(local_result.get("modelStatus") or {})
+    model_status["enrichedByGemini"] = True
+    model_status["enrichmentModel"] = model_name
+
+    return {
+        "success": True,
+        "source": "Local Trained Model",
+        "source_reason": "local_model_confident_with_gemini_enrichment",
+        "model_prediction": local_result.get("model_prediction"),
+        "modelStatus": model_status,
+        "data": normalized,
+    }
+
+
 def detect_disease(image_path):
     threshold = parse_threshold()
     timeout_seconds = parse_local_timeout_seconds()
@@ -704,6 +841,14 @@ def detect_disease(image_path):
     try:
         local_result = run_local_model_prediction_with_timeout(image_path, threshold, timeout_seconds)
         if local_result.get("success"):
+            if is_truthy_env("GEMINI_ENRICH_LOCAL", "false") and os.environ.get("GEMINI_API_KEY"):
+                try:
+                    return run_gemini_enrichment(local_result)
+                except Exception as enrich_exc:
+                    model_status = dict(local_result.get("modelStatus") or {})
+                    model_status["enrichmentError"] = str(enrich_exc)
+                    local_result["modelStatus"] = model_status
+                    return local_result
             return local_result
     except LocalInferenceTimeout as exc:
         local_error = {

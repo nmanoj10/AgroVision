@@ -17,6 +17,8 @@ services:
         generateValue: true
       - key: GEMINI_API_KEY
         sync: false
+      - key: GEMINI_ENRICH_LOCAL
+        value: "true"
       - key: OPENWEATHER_API_KEY
         sync: false
       - key: CLOUDINARY_CLOUD_NAME
